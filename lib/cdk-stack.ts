@@ -4,6 +4,7 @@ import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as logs from 'aws-cdk-lib/aws-logs';
 import * as s3 from 'aws-cdk-lib/aws-s3';
 import { Construct } from 'constructs';
+import * as s3n from 'aws-cdk-lib/aws-s3-notifications';
 
 export class CdkStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
@@ -95,6 +96,122 @@ exports.handler = async (event, context) => {
     subscriptionFilter.node.addDependency(deliveryLogGroup);
     subscriptionFilter.node.addDependency(deliveryBucket);
     subscriptionFilter.node.addDependency(logDeliveryRole);
+
+    // ------------------------------------------------------------
+    // Normalize S3 object names for Athena
+    // ------------------------------------------------------------
+    const sourcePrefix =
+      `AWSLogs/${cdk.Aws.ACCOUNT_ID}/${cdk.Aws.REGION}/` +
+      '_aws_lambda_delivery-class-poc/';
+
+    const normalizeFunction = new lambda.Function(
+      this,
+      'NormalizeDeliveryLogsFunction',
+      {
+        functionName: 'normalize-delivery-class-poc-logs',
+        runtime: lambda.Runtime.NODEJS_24_X,
+        handler: 'index.handler',
+        timeout: cdk.Duration.minutes(1),
+        code: lambda.Code.fromInline(`
+const {
+  S3Client,
+  CopyObjectCommand,
+} = require('@aws-sdk/client-s3');
+
+const s3 = new S3Client({});
+
+exports.handler = async (event) => {
+  for (const record of event.Records ?? []) {
+    const bucket = record.s3.bucket.name;
+
+    const sourceKey = decodeURIComponent(
+      record.s3.object.key.replace(/\\\\+/g, ' ')
+    );
+
+    // Only copy files from the original CloudWatch delivery prefix.
+    if (
+      !sourceKey.startsWith(${JSON.stringify(sourcePrefix)}) ||
+      !sourceKey.endsWith('.log.zst')
+    ) {
+      continue;
+    }
+
+    // Remove the leading underscore from the filename only.
+    const relativeKey = sourceKey.slice(
+      ${JSON.stringify(sourcePrefix.length)}
+    );
+
+    const lastSlash = relativeKey.lastIndexOf('/');
+    const directory = lastSlash >= 0
+      ? relativeKey.slice(0, lastSlash + 1)
+      : '';
+    const filename = lastSlash >= 0
+      ? relativeKey.slice(lastSlash + 1)
+      : relativeKey;
+
+    const normalizedFilename = filename.startsWith('_')
+      ? filename.slice(1)
+      : filename;
+
+    const normalizedRelativeKey = directory + normalizedFilename;
+
+    // Keep normalized objects separate from raw objects.
+    const destinationKey =
+      'athena/' +
+      ${JSON.stringify(sourcePrefix)} +
+      normalizedRelativeKey;
+
+    const copySource =
+      bucket + '/' +
+      sourceKey.split('/').map(encodeURIComponent).join('/');
+
+    await s3.send(new CopyObjectCommand({
+      Bucket: bucket,
+      Key: destinationKey,
+      CopySource: copySource,
+      MetadataDirective: 'COPY',
+    }));
+
+    console.log(JSON.stringify({
+      sourceKey,
+      destinationKey,
+    }));
+  }
+};
+    `),
+      },
+    );
+
+    // DENY the auto-generated log group creation to avoid duplicate CloudWatch log streams.
+    normalizeFunction.addToRolePolicy(
+      new iam.PolicyStatement({
+        effect: iam.Effect.DENY,
+        actions: [
+          'logs:CreateLogGroup',
+          'logs:CreateLogStream',
+          'logs:PutLogEvents',
+        ],
+        resources: ['*'],
+      }),
+    );
+
+    // Allow the normalizer to read the original and write the copy.
+    deliveryBucket.grantReadWrite(normalizeFunction);
+
+    // Trigger only for original CloudWatch delivery objects.
+    // The destination starts with "athena/", so it won't retrigger.
+    deliveryBucket.addEventNotification(
+      s3.EventType.OBJECT_CREATED,
+      new s3n.LambdaDestination(normalizeFunction),
+      {
+        prefix: sourcePrefix,
+        suffix: '.log.zst',
+      },
+    );
+
+    new cdk.CfnOutput(this, 'NormalizedLogsPrefix', {
+      value: `s3://${deliveryBucket.bucketName}/athena/${sourcePrefix}`,
+    });
 
     // ------------------------------------------------------------
     // Outputs
